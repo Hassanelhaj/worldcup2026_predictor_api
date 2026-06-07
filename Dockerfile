@@ -9,9 +9,6 @@ RUN pip install --no-cache-dir -r requirements_api.txt
 # Copy application code
 COPY api.py .
 
-# Copy model artifacts (put your .pkl files + CSV in ./models/)
-COPY models/ ./models/
-
 ENV PORT=5000
 EXPOSE 5000
 
