@@ -8,9 +8,8 @@ Endpoints:
   POST /api/predict-match
 """
 
-import os, json, logging
+import os, logging
 from datetime import datetime
-from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -27,14 +26,46 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ─── Paths ────────────────────────────────────────────────────
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
+# ─── Robust path detection ────────────────────────────────────
+# Works whether run as: python api.py  OR  gunicorn api:app  OR in Jupyter
+try:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _HERE = os.getcwd()   # Jupyter fallback
+
+# Search for the models folder in multiple likely locations
+def _find_models_dir() -> str:
+    candidates = [
+        os.path.join(_HERE, "models"),           # ./models/  (standard)
+        os.path.join(_HERE, "..", "models"),      # ../models/
+        os.path.join(os.getcwd(), "models"),      # cwd/models/
+        "/app/models",                            # Docker / Render absolute
+        "/opt/render/project/src/models",         # Render build path
+        _HERE,                                    # files sitting next to api.py
+        os.getcwd(),                              # files in cwd
+    ]
+    for path in candidates:
+        path = os.path.normpath(path)
+        # Consider a directory valid if it contains the CSV or any .pkl
+        if os.path.isdir(path):
+            contents = os.listdir(path)
+            if any(f.endswith(".pkl") or f.endswith(".csv") for f in contents):
+                log.info(f"Models directory found: {path}  contents={contents}")
+                return path
+    # Fallback — return the default even if empty
+    default = os.path.join(_HERE, "models")
+    log.warning(f"No models directory found with files. Defaulting to: {default}")
+    return default
+
+MODELS_DIR = _find_models_dir()
 CSV_PATH   = os.path.join(MODELS_DIR, "wc2026_predictions.csv")
 
-# ─── Name standardisation (mirrors training script) ───────────
+log.info(f"BASE_DIR={_HERE}")
+log.info(f"MODELS_DIR={MODELS_DIR}")
+log.info(f"CSV_PATH={CSV_PATH}  exists={os.path.exists(CSV_PATH)}")
+
+# ─── Name standardisation ─────────────────────────────────────
 NAME_MAP = {
-    # Defunct states
     "German DR": "Germany", "East Germany": "Germany", "West Germany": "Germany",
     "USSR": "Russia", "Soviet Union": "Russia", "CIS": "Russia",
     "Czechoslovakia": "Czech Republic",
@@ -48,16 +79,12 @@ NAME_MAP = {
     "Zaire": "DR Congo", "Zaïre": "DR Congo",
     "Western Samoa": "Samoa",
     "Burma": "Myanmar",
-    # Common alternate spellings / short forms
     "Holland": "Netherlands",
     "Korea Republic": "South Korea",
     "Korea DPR": "North Korea",
-    "Ivory Coast": "Ivory Coast",
     "USA": "United States",
     "US": "United States",
-    "UAE": "UAE",
     "IR Iran": "Iran",
-    "Czech Republic": "Czech Republic",
 }
 
 CONFEDERATION_STRENGTH = {
@@ -115,152 +142,152 @@ TEAM_CONFEDERATION = {
 }
 
 def standardise(name: str) -> str:
-    """Resolve historical / alternate team names to current canonical names."""
     return NAME_MAP.get(name, name)
 
 def conf_multiplier(team: str) -> float:
-    conf = TEAM_CONFEDERATION.get(team, None)
-    return CONFEDERATION_STRENGTH.get(conf, 1.0)
+    conf = TEAM_CONFEDERATION.get(team)
+    return CONFEDERATION_STRENGTH.get(conf, 1.0) if conf else 1.0
 
 # ─── Model state ──────────────────────────────────────────────
 _models: dict = {}
-_tournament_df: pd.DataFrame | None = None
+_tournament_df = None
 _loaded_at: str | None = None
+_load_errors: list = []
 
 def load_models() -> bool:
-    """Load all artifacts from /models directory. Returns True if successful."""
-    global _models, _tournament_df, _loaded_at
-    try:
-        required = ["best_classifier.pkl", "poisson_home.pkl",
-                    "poisson_away.pkl", "label_encoder.pkl"]
+    global _models, _tournament_df, _loaded_at, _load_errors
+    _load_errors = []
 
-        missing = [f for f in required
-                   if not os.path.exists(os.path.join(MODELS_DIR, f))]
-        if missing:
-            log.warning(f"Missing model files: {missing} — running in CSV-only mode.")
+    # ── 1. Load ML model files ─────────────────────────────────
+    pkl_files = {
+        "classifier":    "best_classifier.pkl",
+        "poisson_home":  "poisson_home.pkl",
+        "poisson_away":  "poisson_away.pkl",
+        "label_encoder": "label_encoder.pkl",
+    }
+    missing = []
+    for key, fname in pkl_files.items():
+        fpath = os.path.join(MODELS_DIR, fname)
+        if os.path.exists(fpath):
+            try:
+                _models[key] = joblib.load(fpath)
+                log.info(f"Loaded {fname}")
+            except Exception as e:
+                err = f"Failed to load {fname}: {e}"
+                log.error(err)
+                _load_errors.append(err)
         else:
-            _models["classifier"]    = joblib.load(os.path.join(MODELS_DIR, "best_classifier.pkl"))
-            _models["poisson_home"]  = joblib.load(os.path.join(MODELS_DIR, "poisson_home.pkl"))
-            _models["poisson_away"]  = joblib.load(os.path.join(MODELS_DIR, "poisson_away.pkl"))
-            _models["label_encoder"] = joblib.load(os.path.join(MODELS_DIR, "label_encoder.pkl"))
+            missing.append(fname)
 
-            feat_path = os.path.join(MODELS_DIR, "feature_cols.pkl")
-            _models["feature_cols"] = (joblib.load(feat_path) if os.path.exists(feat_path)
-                                       else ["elo_diff","rest_diff","home_form_avg","away_form_avg",
-                                             "home_gd_last10","away_gd_last10",
-                                             "home_conf_mult","away_conf_mult"])
-            log.info("All model artifacts loaded.")
+    if missing:
+        msg = f"Missing model files (CSV-only mode): {missing}"
+        log.warning(msg)
+        _load_errors.append(msg)
+    else:
+        # Optional feature_cols.pkl
+        fc_path = os.path.join(MODELS_DIR, "feature_cols.pkl")
+        if os.path.exists(fc_path):
+            try:
+                _models["feature_cols"] = joblib.load(fc_path)
+                log.info("Loaded feature_cols.pkl")
+            except Exception as e:
+                log.warning(f"Could not load feature_cols.pkl: {e}")
 
-        if os.path.exists(CSV_PATH):
+        if "feature_cols" not in _models:
+            _models["feature_cols"] = [
+                "elo_diff", "rest_diff", "home_form_avg", "away_form_avg",
+                "home_gd_last10", "away_gd_last10", "home_conf_mult", "away_conf_mult"
+            ]
+
+    # ── 2. Load tournament CSV ─────────────────────────────────
+    if os.path.exists(CSV_PATH):
+        try:
             df = pd.read_csv(CSV_PATH)
-            # Normalise column names to lowercase / short form
+            log.info(f"CSV loaded: {CSV_PATH}  shape={df.shape}  cols={list(df.columns)}")
+
+            # Normalise column names
             col_map = {
                 "Team": "team",
-                "Round of 32": "r32", "Round of 16": "r16",
-                "Quarter-final": "qf", "Semi-final": "sf",
-                "Final": "final", "Champion": "champ",
-                # Allow alternate column names from Kaggle / other exports
-                "r32": "r32", "r16": "r16", "qf": "qf",
-                "sf": "sf", "final": "final", "champ": "champ",
+                "Round of 32": "r32",
+                "Round of 16": "r16",
+                "Quarter-final": "qf",
+                "Semi-final": "sf",
+                "Final": "final",
+                "Champion": "champ",
             }
             df.rename(columns={k: v for k, v in col_map.items() if k in df.columns},
                       inplace=True)
 
-            # Strip "%" and cast to float
-            pct_cols = [c for c in ["r32","r16","qf","sf","final","champ",
-                                    "group_winner_prob"] if c in df.columns]
-            for col in pct_cols:
-                if df[col].dtype == object:
+            # Strip "%" and cast to float for any column that needs it
+            for col in ["r32","r16","qf","sf","final","champ","group_winner_prob"]:
+                if col in df.columns and df[col].dtype == object:
                     df[col] = df[col].str.rstrip("%").astype(float)
 
-            # Add group_winner_prob if missing (use r32 as proxy)
+            # Add group_winner_prob column if absent
             if "group_winner_prob" not in df.columns and "r32" in df.columns:
-                df["group_winner_prob"] = df["r32"] / 2   # rough heuristic
+                df["group_winner_prob"] = (df["r32"] / 2).round(1)
 
             _tournament_df = df
-            log.info(f"Tournament CSV loaded: {len(df)} teams.")
-        else:
-            log.warning(f"No CSV found at {CSV_PATH}.")
+            log.info(f"Tournament data ready: {len(df)} teams.")
+        except Exception as e:
+            err = f"Failed to load CSV: {e}"
+            log.error(err)
+            _load_errors.append(err)
+    else:
+        err = f"CSV not found at {CSV_PATH}. Directory listing: {os.listdir(MODELS_DIR) if os.path.isdir(MODELS_DIR) else 'DIR MISSING'}"
+        log.error(err)
+        _load_errors.append(err)
 
-        _loaded_at = datetime.utcnow().isoformat() + "Z"
-        return True
-
-    except Exception as exc:
-        log.error(f"Error loading models: {exc}", exc_info=True)
-        return False
+    _loaded_at = datetime.utcnow().isoformat() + "Z"
+    return _tournament_df is not None
 
 
 def _build_feature_row(team1: str, team2: str) -> np.ndarray:
-    """
-    Build a feature vector for a head-to-head prediction.
-    Uses neutral / mean values for stats we don't have in real-time.
-    team1 is treated as 'home' (advantage=0 since neutral).
-    """
-    # ELO difference: we don't have live ELO here, so use 0 (neutral)
-    elo_diff       = 0.0
-    rest_diff      = 0.0
-    home_form_avg  = 0.5   # mean win-rate
-    away_form_avg  = 0.5
-    home_gd_last10 = 0.0
-    away_gd_last10 = 0.0
-    home_conf_mult = conf_multiplier(team1)
-    away_conf_mult = conf_multiplier(team2)
-
-    # If we have the simulation CSV, use champ% difference as a rough proxy for quality
+    """Build feature vector — uses CSV champion% as ELO proxy when live ELO unavailable."""
+    elo_diff = 0.0
     if _tournament_df is not None:
-        t1_row = _tournament_df[_tournament_df["team"] == team1]
-        t2_row = _tournament_df[_tournament_df["team"] == team2]
-        if not t1_row.empty and not t2_row.empty:
-            # Use champion probability ratio to proxy ELO difference
-            c1 = float(t1_row["champ"].iloc[0]) + 0.1   # avoid div/0
-            c2 = float(t2_row["champ"].iloc[0]) + 0.1
-            # Map to rough ELO scale: 100 ELO pts ≈ 64% expected score
-            elo_diff = (c1 - c2) * 15   # heuristic scaling
+        r1 = _tournament_df[_tournament_df["team"] == team1]
+        r2 = _tournament_df[_tournament_df["team"] == team2]
+        if not r1.empty and not r2.empty:
+            c1 = float(r1["champ"].iloc[0]) + 0.1
+            c2 = float(r2["champ"].iloc[0]) + 0.1
+            elo_diff = (c1 - c2) * 15   # heuristic scaling to ELO-like range
 
     feat_map = {
         "elo_diff":       elo_diff,
-        "rest_diff":      rest_diff,
-        "home_form_avg":  home_form_avg,
-        "away_form_avg":  away_form_avg,
-        "home_gd_last10": home_gd_last10,
-        "away_gd_last10": away_gd_last10,
-        "home_conf_mult": home_conf_mult,
-        "away_conf_mult": away_conf_mult,
+        "rest_diff":      0.0,
+        "home_form_avg":  0.5,
+        "away_form_avg":  0.5,
+        "home_gd_last10": 0.0,
+        "away_gd_last10": 0.0,
+        "home_conf_mult": conf_multiplier(team1),
+        "away_conf_mult": conf_multiplier(team2),
     }
-
     cols = _models.get("feature_cols", list(feat_map.keys()))
     return np.array([[feat_map.get(c, 0.0) for c in cols]])
 
 
 def _fallback_predict(team1: str, team2: str) -> dict:
-    """
-    Pure ELO/CSV-based prediction when ML models aren't loaded.
-    Uses champion probabilities as a quality proxy.
-    """
-    t1_champ, t2_champ = 0.05, 0.05   # default equal
+    """CSV-based prediction when ML models are not loaded."""
+    t1_champ, t2_champ = 0.05, 0.05
     if _tournament_df is not None:
         r1 = _tournament_df[_tournament_df["team"] == team1]
         r2 = _tournament_df[_tournament_df["team"] == team2]
         if not r1.empty: t1_champ = float(r1["champ"].iloc[0]) / 100 + 0.001
         if not r2.empty: t2_champ = float(r2["champ"].iloc[0]) / 100 + 0.001
 
-    total = t1_champ + t2_champ + 0.25          # 0.25 reserved for draw
-    p1    = round(t1_champ / total * 100, 1)
-    p2    = round(t2_champ / total * 100, 1)
-    pd_   = round(100 - p1 - p2, 1)
-
-    winner = team1 if p1 > p2 else team2
-    conf   = round(max(p1, p2), 1)
-
-    exp_h = round(1.3 + (t1_champ - t2_champ) * 5, 2)
-    exp_a = round(1.3 - (t1_champ - t2_champ) * 5, 2)
+    total = t1_champ + t2_champ + 0.25
+    p1  = round(t1_champ / total * 100, 1)
+    p2  = round(t2_champ / total * 100, 1)
+    pd_ = round(100 - p1 - p2, 1)
 
     return {
         "team1": team1, "team2": team2,
         "team1_win": p1, "draw": pd_, "team2_win": p2,
-        "winner": winner, "confidence": conf,
-        "expected_goals_team1": max(0.3, exp_h),
-        "expected_goals_team2": max(0.3, exp_a),
+        "winner": team1 if p1 > p2 else team2,
+        "confidence": round(max(p1, p2), 1),
+        "expected_goals_team1": max(0.3, round(1.3 + (t1_champ - t2_champ) * 5, 2)),
+        "expected_goals_team2": max(0.3, round(1.3 - (t1_champ - t2_champ) * 5, 2)),
         "model_used": "fallback_csv",
     }
 
@@ -276,66 +303,67 @@ load_models()
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({
-        "status": "ok",
-        "models_loaded": bool(_models),
-        "csv_loaded": _tournament_df is not None,
-        "teams_count": len(_tournament_df) if _tournament_df is not None else 0,
-        "loaded_at": _loaded_at,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "status":        "ok",
+        "models_loaded": bool(_models.get("classifier")),
+        "csv_loaded":    _tournament_df is not None,
+        "teams_count":   len(_tournament_df) if _tournament_df is not None else 0,
+        "models_dir":    MODELS_DIR,
+        "csv_path":      CSV_PATH,
+        "dir_exists":    os.path.isdir(MODELS_DIR),
+        "dir_contents":  os.listdir(MODELS_DIR) if os.path.isdir(MODELS_DIR) else [],
+        "load_errors":   _load_errors,
+        "loaded_at":     _loaded_at,
+        "timestamp":     datetime.utcnow().isoformat() + "Z",
     })
 
 
 @app.route("/api/tournament-data", methods=["GET"])
 def tournament_data():
     if _tournament_df is None:
-        return jsonify({"error": "Tournament data not loaded"}), 503
+        return jsonify({
+            "error": "Tournament CSV not loaded",
+            "hint":  "Upload wc2026_predictions.csv to the models/ folder in your repo",
+            "errors": _load_errors,
+        }), 503
 
     df = _tournament_df.copy()
 
-    # Top 10 by champion probability
-    top10 = (df.nlargest(10, "champ")
-               [["team","champ"]]
+    top10 = (df.nlargest(10, "champ")[["team","champ"]]
                .rename(columns={"champ":"champion_prob"})
                .to_dict(orient="records"))
 
-    # All teams full data
     stage_cols = [c for c in ["r32","r16","qf","sf","final","champ","group_winner_prob"]
                   if c in df.columns]
-    all_teams = df[["team"] + stage_cols].to_dict(orient="records")
+    all_teams  = df[["team"] + stage_cols].to_dict(orient="records")
 
-    # Champion probabilities dict
-    champ_dict = dict(zip(df["team"], df["champ"].round(2)))
-
-    # Group winner probabilities dict
     gw_col = "group_winner_prob" if "group_winner_prob" in df.columns else "r32"
-    gw_dict = dict(zip(df["team"], df[gw_col].round(2)))
 
     return jsonify({
-        "top10":                    top10,
-        "all_teams":                all_teams,
-        "champion_probabilities":   champ_dict,
-        "group_winner_probabilities": gw_dict,
-        "last_updated":             _loaded_at,
-        "teams_count":              len(df),
+        "top10":                      top10,
+        "all_teams":                  all_teams,
+        "champion_probabilities":     dict(zip(df["team"], df["champ"].round(2))),
+        "group_winner_probabilities": dict(zip(df["team"], df[gw_col].round(2))),
+        "last_updated":               _loaded_at,
+        "teams_count":                len(df),
     })
 
 
 @app.route("/api/team-path/<path:team_name>", methods=["GET"])
 def team_path(team_name: str):
     if _tournament_df is None:
-        return jsonify({"error": "Tournament data not loaded"}), 503
+        return jsonify({"error": "Tournament CSV not loaded"}), 503
 
     team = standardise(team_name)
     row  = _tournament_df[_tournament_df["team"].str.lower() == team.lower()]
     if row.empty:
-        # Try partial match
-        row = _tournament_df[_tournament_df["team"].str.lower().str.contains(
-            team.lower(), na=False)]
+        row = _tournament_df[
+            _tournament_df["team"].str.lower().str.contains(team.lower(), na=False)]
     if row.empty:
-        return jsonify({"error": f"Team '{team_name}' not found"}), 404
+        return jsonify({"error": f"Team '{team_name}' not found",
+                        "available": _tournament_df["team"].tolist()}), 404
 
     r = row.iloc[0]
-    payload = {
+    return jsonify({
         "team":              r["team"],
         "r32":               float(r["r32"])               if "r32"               in r.index else None,
         "r16":               float(r["r16"])               if "r16"               in r.index else None,
@@ -344,67 +372,49 @@ def team_path(team_name: str):
         "final":             float(r["final"])             if "final"             in r.index else None,
         "champ":             float(r["champ"])             if "champ"             in r.index else None,
         "group_winner_prob": float(r["group_winner_prob"]) if "group_winner_prob" in r.index else None,
-    }
-    return jsonify(payload)
+    })
 
 
 @app.route("/api/predict-match", methods=["POST"])
 def predict_match():
-    body = request.get_json(silent=True) or {}
-    raw1 = body.get("team1", "").strip()
-    raw2 = body.get("team2", "").strip()
+    body  = request.get_json(silent=True) or {}
+    team1 = standardise(body.get("team1", "").strip())
+    team2 = standardise(body.get("team2", "").strip())
 
-    if not raw1 or not raw2:
+    if not team1 or not team2:
         return jsonify({"error": "Both team1 and team2 are required"}), 400
-
-    team1 = standardise(raw1)
-    team2 = standardise(raw2)
-
     if team1 == team2:
         return jsonify({"error": "Teams must be different"}), 400
 
-    # ── Use ML models if available ────────────────────────────
     if "classifier" in _models:
         try:
-            feat = _build_feature_row(team1, team2)
-            clf  = _models["classifier"]
-            proba = clf.predict_proba(feat)[0]   # [away_win, draw, home_win]
-
-            # Map class indices; classes_ order may vary
+            feat   = _build_feature_row(team1, team2)
+            clf    = _models["classifier"]
+            proba  = clf.predict_proba(feat)[0]
             classes = list(clf.classes_)
-            # 0 = away win, 1 = draw, 2 = home win
-            p_t1  = round(float(proba[classes.index(2)]) * 100, 1)
-            p_dr  = round(float(proba[classes.index(1)]) * 100, 1)
-            p_t2  = round(float(proba[classes.index(0)]) * 100, 1)
 
-            # Poisson goal predictions
-            ph = _models["poisson_home"]
-            pa = _models["poisson_away"]
-            exp_h = round(float(ph.predict(feat)[0]), 2)
-            exp_a = round(float(pa.predict(feat)[0]), 2)
+            p_t1 = round(float(proba[classes.index(2)]) * 100, 1)
+            p_dr = round(float(proba[classes.index(1)]) * 100, 1)
+            p_t2 = round(float(proba[classes.index(0)]) * 100, 1)
 
-            winner = team1 if p_t1 > p_t2 else (team2 if p_t2 > p_t1 else "Draw")
-            conf   = round(max(p_t1, p_t2), 1)
+            exp_h = round(float(_models["poisson_home"].predict(feat)[0]), 2)
+            exp_a = round(float(_models["poisson_away"].predict(feat)[0]), 2)
 
             return jsonify({
                 "team1": team1, "team2": team2,
                 "team1_win": p_t1, "draw": p_dr, "team2_win": p_t2,
-                "winner": winner, "confidence": conf,
+                "winner":     team1 if p_t1 > p_t2 else (team2 if p_t2 > p_t1 else "Draw"),
+                "confidence": round(max(p_t1, p_t2), 1),
                 "expected_goals_team1": max(0.3, exp_h),
                 "expected_goals_team2": max(0.3, exp_a),
                 "model_used": "ml_ensemble",
             })
+        except Exception as e:
+            log.error(f"ML prediction error: {e}", exc_info=True)
 
-        except Exception as exc:
-            log.error(f"ML prediction failed: {exc}", exc_info=True)
-            # Fall through to fallback
-
-    # ── Fallback: CSV-based probability estimate ───────────────
-    result = _fallback_predict(team1, team2)
-    return jsonify(result)
+    return jsonify(_fallback_predict(team1, team2))
 
 
-# ─── 404 / Error handlers ─────────────────────────────────────
 @app.errorhandler(404)
 def not_found(_):
     return jsonify({"error": "Endpoint not found"}), 404
